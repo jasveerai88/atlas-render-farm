@@ -1,0 +1,128 @@
+name: qc-transcribe
+
+# Dispatch-only (see ffmpeg-render.yml header). Transcribes a media file
+# with Whisper and uploads the transcript + a line-completeness QC note
+# back to the same HF dataset. Optionally compares the transcript against
+# a script file in the dataset and reports any scripted lines not heard.
+on:
+  workflow_dispatch:
+    inputs:
+      hf_repo:
+        description: "HF dataset repo holding the media file"
+        required: true
+        type: string
+      input_path:
+        description: "Path of the media file inside the HF dataset"
+        required: true
+        type: string
+      script_path:
+        description: "Optional: path of the script (.txt, one line per row) inside the HF dataset for line-completeness comparison"
+        required: false
+        type: string
+        default: ""
+      model:
+        description: "Whisper model size"
+        required: false
+        type: choice
+        options: ["tiny", "base", "small", "medium"]
+        default: "small"
+
+jobs:
+  qc:
+    runs-on: [self-hosted, mac-m4]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Set up job workspace
+        run: |
+          export PATH="/opt/homebrew/bin:$PATH"
+          python3 -m pip install --user -q huggingface_hub openai-whisper
+          mkdir -p "$RUNNER_TEMP/qc-job"
+          echo "JOB_DIR=$RUNNER_TEMP/qc-job" >> "$GITHUB_ENV"
+
+      - name: Download media (and script if given) from HF dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ inputs.hf_repo }}
+          INPUT_PATH: ${{ inputs.input_path }}
+          SCRIPT_PATH: ${{ inputs.script_path }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
+          kw = dict(repo_id=os.environ["HF_REPO"], repo_type="dataset",
+                    token=os.environ["HF_TOKEN"], local_dir=os.environ["JOB_DIR"])
+          print("media:", hf_hub_download(filename=os.environ["INPUT_PATH"], **kw))
+          if os.environ.get("SCRIPT_PATH"):
+              print("script:", hf_hub_download(filename=os.environ["SCRIPT_PATH"], **kw))
+          PY
+
+      - name: Transcribe with Whisper
+        env:
+          INPUT_PATH: ${{ inputs.input_path }}
+          MODEL: ${{ inputs.model }}
+        run: |
+          export PATH="/opt/homebrew/bin:$PATH"
+          cd "$JOB_DIR"
+          whisper "$INPUT_PATH" --model "$MODEL" --output_format srt --output_dir "$JOB_DIR"
+          ls -lh "$JOB_DIR"
+
+      - name: Line-completeness check (when a script was supplied)
+        env:
+          INPUT_PATH: ${{ inputs.input_path }}
+          SCRIPT_PATH: ${{ inputs.script_path }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          job = os.environ["JOB_DIR"]
+          base = os.path.splitext(os.path.basename(os.environ["INPUT_PATH"]))[0]
+          srt = open(os.path.join(job, base + ".srt"), encoding="utf-8").read()
+          heard = re.sub(r"[^a-z0-9 ]", " ", " ".join(
+              l for l in srt.splitlines() if l and not l[0].isdigit() and "-->" not in l).lower())
+          report = ["QC TRANSCRIBE REPORT", f"media: {os.environ['INPUT_PATH']}"]
+          sp = os.environ.get("SCRIPT_PATH")
+          if sp:
+              lines = [l.strip() for l in open(os.path.join(job, sp), encoding="utf-8") if l.strip()]
+              missing = []
+              for line in lines:
+                  probe = re.sub(r"[^a-z0-9 ]", " ", line.lower()).strip()
+                  words = probe.split()
+                  # a line counts as heard if at least 80% of its words appear in order in the transcript stream
+                  stream = heard.split()
+                  idx, hit = 0, 0
+                  for w in words:
+                      while idx < len(stream) and stream[idx] != w:
+                          idx += 1
+                      if idx < len(stream):
+                          hit += 1; idx += 1
+                  if words and hit / len(words) < 0.8:
+                      missing.append(line)
+              report.append(f"script lines: {len(lines)}, not heard: {len(missing)}")
+              report += [f"MISSING: {m}" for m in missing]
+              report.append("VERDICT: " + ("FAIL — lines missing" if missing else "PASS — every scripted line heard"))
+          else:
+              report.append("no script supplied — transcript only, no completeness verdict")
+          open(os.path.join(job, "qc-report.txt"), "w", encoding="utf-8").write("\n".join(report) + "\n")
+          print("\n".join(report))
+          PY
+
+      - name: Upload transcript + QC report to HF dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ inputs.hf_repo }}
+          INPUT_PATH: ${{ inputs.input_path }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+          job = os.environ["JOB_DIR"]
+          base = os.path.splitext(os.path.basename(os.environ["INPUT_PATH"]))[0]
+          stem = os.path.splitext(os.environ["INPUT_PATH"])[0]
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          for local, remote in [(os.path.join(job, base + ".srt"), stem + ".srt"),
+                                (os.path.join(job, "qc-report.txt"), stem + ".qc-report.txt")]:
+              api.upload_file(path_or_fileobj=local, path_in_repo=remote,
+                              repo_id=os.environ["HF_REPO"], repo_type="dataset")
+              print("uploaded:", remote)
+          PY
