@@ -1,0 +1,95 @@
+name: upscale-mps
+
+# Dispatch-only (see ffmpeg-render.yml header). One upscale at a time:
+# the M4's MPS GPU and the Mac's tight internal disk cannot take parallel
+# upscale batches.
+on:
+  workflow_dispatch:
+    inputs:
+      hf_repo:
+        description: "HF dataset repo holding the input image(s)"
+        required: true
+        type: string
+      input_path:
+        description: "Path of the input image inside the HF dataset"
+        required: true
+        type: string
+      output_path:
+        description: "Path to write the upscaled image back to in the HF dataset"
+        required: true
+        type: string
+      scale:
+        description: "Upscale factor"
+        required: false
+        type: choice
+        options: ["2", "4"]
+        default: "2"
+
+concurrency:
+  group: upscale-mps
+  cancel-in-progress: false
+
+jobs:
+  upscale:
+    runs-on: [self-hosted, mac-m4]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Set up job workspace
+        run: |
+          python3 -m pip install --user -q huggingface_hub
+          mkdir -p "$RUNNER_TEMP/upscale-job"
+          echo "JOB_DIR=$RUNNER_TEMP/upscale-job" >> "$GITHUB_ENV"
+
+      - name: Download input from HF dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ inputs.hf_repo }}
+          INPUT_PATH: ${{ inputs.input_path }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
+          p = hf_hub_download(repo_id=os.environ["HF_REPO"],
+                              filename=os.environ["INPUT_PATH"],
+                              repo_type="dataset",
+                              token=os.environ["HF_TOKEN"],
+                              local_dir=os.environ["JOB_DIR"])
+          print("downloaded:", p)
+          PY
+
+      - name: Upscale with RealESRGAN (MPS)
+        env:
+          INPUT_PATH: ${{ inputs.input_path }}
+          SCALE: ${{ inputs.scale }}
+        run: |
+          # Uses the proven MacWorker RealESRGAN torch tiled loader on the
+          # Mac (tools/stock-factory/sr_torch.py pattern, RealESRGAN_x2plus
+          # weights). The script lives on the Mac, not in this repo.
+          SR="$HOME/MacWorker/sr_torch.py"
+          if [ ! -f "$SR" ]; then
+            echo "sr_torch.py not found on the Mac at $SR — upscale tool not staged. Failing cleanly."
+            exit 1
+          fi
+          python3 "$SR" --input "$JOB_DIR/$INPUT_PATH" \
+                        --output "$JOB_DIR/upscaled.png" \
+                        --scale "$SCALE" --device mps
+          ls -lh "$JOB_DIR/upscaled.png"
+
+      - name: Upload result to HF dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ inputs.hf_repo }}
+          OUTPUT_PATH: ${{ inputs.output_path }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          api.upload_file(path_or_fileobj=os.path.join(os.environ["JOB_DIR"], "upscaled.png"),
+                          path_in_repo=os.environ["OUTPUT_PATH"],
+                          repo_id=os.environ["HF_REPO"],
+                          repo_type="dataset")
+          print("uploaded:", os.environ["OUTPUT_PATH"])
+          PY
