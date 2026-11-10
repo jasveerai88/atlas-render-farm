@@ -1,0 +1,88 @@
+name: ffmpeg-render
+
+# Dispatch-only by design: nothing in this repo ever runs on push/PR,
+# so untrusted code cannot execute on the self-hosted Mac runner.
+on:
+  workflow_dispatch:
+    inputs:
+      hf_repo:
+        description: "HF dataset repo holding the input media (e.g. jasveerai88/atlas-storage)"
+        required: true
+        type: string
+      input_path:
+        description: "Path of the input file inside the HF dataset"
+        required: true
+        type: string
+      output_path:
+        description: "Path to write the rendered file back to in the HF dataset"
+        required: true
+        type: string
+      ffmpeg_args:
+        description: "Extra ffmpeg arguments (filters etc.). The job runs: ffmpeg -y -i <input> <args> <output>. For styled captions, pass a subtitles filter pointing at a styled .ass file included in the input dataset."
+        required: false
+        type: string
+        default: "-c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart"
+
+jobs:
+  render:
+    runs-on: [self-hosted, mac-m4]
+    # The default shell on macOS runners is zsh for run steps in some
+    # contexts; pin bash so PATH handling below is predictable.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Set up job workspace
+        run: |
+          export PATH="/opt/homebrew/bin:$PATH"
+          ffmpeg -version | head -1
+          python3 -m pip install --user -q huggingface_hub
+          mkdir -p "$RUNNER_TEMP/render-job"
+          echo "JOB_DIR=$RUNNER_TEMP/render-job" >> "$GITHUB_ENV"
+
+      - name: Download input from HF dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ inputs.hf_repo }}
+          INPUT_PATH: ${{ inputs.input_path }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
+          p = hf_hub_download(repo_id=os.environ["HF_REPO"],
+                              filename=os.environ["INPUT_PATH"],
+                              repo_type="dataset",
+                              token=os.environ["HF_TOKEN"],
+                              local_dir=os.environ["JOB_DIR"])
+          print("downloaded:", p)
+          PY
+
+      - name: Render with ffmpeg
+        env:
+          INPUT_PATH: ${{ inputs.input_path }}
+          FFMPEG_ARGS: ${{ inputs.ffmpeg_args }}
+        run: |
+          export PATH="/opt/homebrew/bin:$PATH"
+          in_file="$JOB_DIR/$INPUT_PATH"
+          out_file="$JOB_DIR/output.mp4"
+          echo "ffmpeg -y -i $in_file $FFMPEG_ARGS $out_file"
+          # shellcheck disable=SC2086
+          ffmpeg -y -i "$in_file" $FFMPEG_ARGS "$out_file"
+          ls -lh "$out_file"
+
+      - name: Upload result to HF dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ inputs.hf_repo }}
+          OUTPUT_PATH: ${{ inputs.output_path }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          api.upload_file(path_or_fileobj=os.path.join(os.environ["JOB_DIR"], "output.mp4"),
+                          path_in_repo=os.environ["OUTPUT_PATH"],
+                          repo_id=os.environ["HF_REPO"],
+                          repo_type="dataset")
+          print("uploaded:", os.environ["OUTPUT_PATH"])
+          PY
